@@ -11,13 +11,13 @@
 
 ## 📋 1. Подготовка и Установка
 
-1. Перенесите скрипт `amneziawg_install.sh` на ваш сервер (Ubuntu/Debian).
+1. Перенесите скрипт `awg_install.sh` на ваш сервер (Ubuntu/Debian).
 2. Создайте **нового** бота в Telegram через [@BotFather](https://t.me/BotFather), чтобы он не конфликтовал с ботом от обычного WireGuard. Сохраните выданный токен.
 3. Узнайте свой Telegram User ID через бота [@userinfobot](https://t.me/userinfobot).
 4. Запустите скрипт:
    ```bash
-   chmod +x amneziawg_install.sh
-   sudo ./amneziawg_install.sh
+   chmod +x awg_install.sh
+   sudo ./awg_install.sh
    ```
 5. Следуйте инструкциям на экране (введите новый токен бота, ваш ID и желаемый промокод).
 
