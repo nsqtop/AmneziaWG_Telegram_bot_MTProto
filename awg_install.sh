@@ -76,7 +76,7 @@ install_amneziawg() {
     fi
     
     # Install AmneziaWG
-    apt-get install -y amneziawg-tools amneziawg-dkms || { echo -e "${RED}Failed to install AmneziaWG. Make sure you are using a supported OS.${NC}"; exit 1; }
+    apt-get install -y amneziawg-tools golang && cd /usr/src && rm -rf amneziawg-go && git clone https://github.com/amnezia-vpn/amneziawg-go.git && cd amneziawg-go && make && cp amneziawg-go /usr/bin/ || { echo -e "${RED}Failed to install AmneziaWG. Make sure you are using a supported OS.${NC}"; exit 1; }
     
     # Enable IP forwarding (idempotent)
     sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
@@ -94,7 +94,7 @@ install_amneziawg() {
 
 # Configure AmneziaWG
 configure_amneziawg() {
-    echo -e "${YELLOW}Configuring AmneziaWG (Port 51821, Subnet 10.0.1.x)...${NC}"
+    echo -e "${YELLOW}Configuring AmneziaWG (Port 443, Subnet 10.0.1.x)...${NC}"
     
     cd /etc/amnezia/amneziawg || { echo -e "${RED}Failed to change directory${NC}"; exit 1; }
     
@@ -136,7 +136,7 @@ configure_amneziawg() {
     cat > /etc/amnezia/amneziawg/awg0.conf <<EOF
 [Interface]
 Address = 10.0.1.1/24
-ListenPort = 51821
+ListenPort = 443
 PrivateKey = $SERVER_PRIV_KEY
 Jc = $JC
 Jmin = $JMIN
@@ -159,6 +159,7 @@ EOF
 PrivateKey = 
 Address = 
 DNS = 8.8.8.8, 1.1.1.1
+MTU = 1200
 Jc = $JC
 Jmin = $JMIN
 Jmax = $JMAX
@@ -171,83 +172,119 @@ H4 = $H4
 
 [Peer]
 PublicKey = $SERVER_PUB_KEY
-Endpoint = $SERVER_IP:51821
+Endpoint = $SERVER_IP:443
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
     
     # Enable AmneziaWG service
-    systemctl enable awg-quick@awg0 2>/dev/null || echo -e "${YELLOW}Warning: Could not enable AmneziaWG service${NC}"
+    systemctl enable awg-quick@awg0
+
+    # Create clear_users script
+    cat << 'SCRIPTEOF' > /opt/vpn/clear_users.sh
+#!/bin/bash
+
+echo -e "\e[33mОчистка всех конфигураций пользователей AmneziaWG...\e[0m"
+
+# 1. Остановка бота
+echo "Останавливаем Telegram-бота..."
+systemctl stop telegram-bot-awg
+
+# 2. Очистка базы данных бота
+echo "Очищаем базу данных пользователей бота..."
+echo "{}" > /opt/telegram-bot-awg/users.json
+
+# 3. Удаление клиентских файлов
+echo "Удаляем клиентские файлы (конфиги и QR-коды)..."
+find /root/amneziawg-clients/ -type f -not -name 'client-template.conf' -delete
+
+# 4. Очистка конфигурации сервера (удаление секций [Peer])
+echo "Удаляем пиров из конфигурации сервера..."
+sed -i '/^\[Peer\]/,$d' /etc/amnezia/amneziawg/awg0.conf
+
+# Добавляем пустую строку в конец для порядка
+echo "" >> /etc/amnezia/amneziawg/awg0.conf
+
+# 5. Перезапуск интерфейса
+echo "Перезапускаем интерфейс AmneziaWG..."
+systemctl restart awg-quick@awg0
+
+# 6. Запуск бота
+echo "Запускаем Telegram-бота..."
+systemctl start telegram-bot-awg
+
+echo -e "\e[32mГотово! Все пользователи успешно удалены. База чиста.\e[0m"
+SCRIPTEOF
+    chmod +x /opt/vpn/clear_users.sh
+ 2>/dev/null || echo -e "${YELLOW}Warning: Could not enable AmneziaWG service${NC}"
     systemctl start awg-quick@awg0 2>/dev/null || echo -e "${YELLOW}Warning: Could not start AmneziaWG service${NC}"
     
     echo -e "${GREEN}✓ AmneziaWG configured with Anti-DPI parameters${NC}"
     echo -e "${BLUE}Server Public Key: ${SERVER_PUB_KEY}${NC}"
 }
 
-# Install MTProto Proxy
+# Install MTProto Proxy (Docker)
+# Install MTProto Proxy (Docker)
 install_mtproto() {
-    if systemctl is-active --quiet mtproto; then
-        echo -e "${GREEN}✓ MTProto Proxy is already running (from previous WG installation). Skipping installation.${NC}"
-        return
+    echo -e "${YELLOW}Installing MTProto Proxy (via Docker)...${NC}"
+    
+    # Check if docker is installed
+    if ! command -v docker &> /dev/null; then
+        echo -e "${YELLOW}Installing Docker...${NC}"
+        apt-get update
+        apt-get install -y ca-certificates curl gnupg lsb-release
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg || true
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        apt-get update
+        apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-compose || {
+            apt-get install -y docker.io docker-compose
+        }
     fi
+    
+    systemctl enable docker
+    systemctl start docker
 
-    echo -e "${YELLOW}Installing MTProto Proxy...${NC}"
+    mkdir -p /opt/mtproxy
     
-    apt-get install -y git build-essential libssl-dev zlib1g-dev || { echo -e "${RED}Failed to install MTProto dependencies${NC}"; exit 1; }
-    
-    cd /opt || { echo -e "${RED}Failed to change to /opt${NC}"; exit 1; }
-    
-    if [[ -d MTProxy ]]; then
-        rm -rf MTProxy
+    # Generate secret if not exists
+    if [ -f /root/mtproto-info.txt ]; then
+        secret=$(grep "MTProxy Secret:" /root/mtproto-info.txt | awk '{print $3}')
     fi
     
-    git clone https://github.com/TelegramMessenger/MTProxy || { echo -e "${RED}Failed to clone MTProto repository${NC}"; exit 1; }
-    cd MTProxy || { echo -e "${RED}Failed to enter MTProxy directory${NC}"; exit 1; }
-    
-    make || { echo -e "${RED}Failed to build MTProto${NC}"; exit 1; }
-    cp objs/bin/mtproto-proxy /usr/local/bin/ || { echo -e "${RED}Failed to copy mtproto-proxy binary${NC}"; exit 1; }
-    
-    mkdir -p /etc/mtproto
-    secret=$(head -c 16 /dev/urandom | xxd -ps)
-    echo "$secret" > /etc/mtproto/secret
-    
-    # Download MTProto config files from Telegram
-    curl -s https://core.telegram.org/getProxySecret -o /etc/mtproto/proxy-secret
-    curl -s https://core.telegram.org/getProxyConfig -o /etc/mtproto/proxy-multi.conf
-    
-    cat > /etc/systemd/system/mtproto.service <<EOF
-[Unit]
-Description=MTProto Proxy
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/etc/mtproto
-ExecStart=/usr/local/bin/mtproto-proxy -u nobody -p 8888 -H 443 -S $secret --aes-pwd proxy-secret proxy-multi.conf -M 1
-Restart=on-failure
-RestartSec=10
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    systemctl daemon-reload
-    systemctl enable mtproto 2>/dev/null || echo -e "${YELLOW}Warning: Could not enable mtproto service${NC}"
-    systemctl start mtproto 2>/dev/null || echo -e "${YELLOW}Warning: Could not start mtproto service${NC}"
+    if [ -z "$secret" ]; then
+        secret=$(head -c 16 /dev/urandom | xxd -ps)
+    fi
     
     PROXY_IP=$SERVER_IP
-    PROXY_PORT=443
+    PROXY_PORT=8443
     PROXY_SECRET=$secret
+
+    cat > /opt/mtproxy/docker-compose.yml <<DOCKEREOF
+version: '3'
+services:
+  mtproxy:
+    image: telegrammessenger/proxy:latest
+    restart: always
+    ports:
+      - "${PROXY_PORT}:443"
+    environment:
+      - SECRET=${PROXY_SECRET}
+      - WORKERS=1
+DOCKEREOF
+
+    cd /opt/mtproxy
+    docker-compose down 2>/dev/null || true
+    docker-compose up -d || { echo -e "${RED}Failed to start MTProto container${NC}"; exit 1; }
     
-    echo -e "${GREEN}✓ MTProto Proxy installed${NC}"
+    echo -e "${GREEN}✓ MTProto Proxy installed and running via Docker${NC}"
     
-    cat > /root/mtproto-info.txt <<EOF
+    cat > /root/mtproto-info.txt <<INFOEOF
 MTProxy IP: $PROXY_IP
 MTProxy Port: $PROXY_PORT
 MTProxy Secret: $PROXY_SECRET
 MTProxy Link: tg://proxy?server=$PROXY_IP&port=$PROXY_PORT&secret=$PROXY_SECRET
-EOF
+INFOEOF
 }
 
 # Setup Telegram Bot
@@ -369,7 +406,7 @@ def load_server_key():
             content = f.read()
             with open(f'{CLIENTS_DIR}/client-template.conf', 'r') as tf:
                 template = tf.read()
-                match = re.search(r'Endpoint = (.+):51821', template)
+                match = re.search(r'Endpoint = (.+):443', template)
                 if match:
                     SERVER_IP = match.group(1)
                 else:
@@ -440,11 +477,12 @@ def generate_awg_config(client_name, tg_user=None):
 PrivateKey = {private_key}
 Address = {client_ip}/24
 DNS = 8.8.8.8, 1.1.1.1
+MTU = 1200
 {awg_params_str}
 
 [Peer]
 PublicKey = {SERVER_PUB_KEY}
-Endpoint = {SERVER_IP}:51821
+Endpoint = {SERVER_IP}:443
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 """
@@ -790,7 +828,7 @@ configure_firewall() {
     ufw default deny incoming 2>/dev/null
     ufw default allow outgoing 2>/dev/null
     ufw allow 22/tcp 2>/dev/null
-    ufw allow 51821/udp 2>/dev/null
+    ufw allow 443/udp 2>/dev/null
     ufw allow 443/tcp 2>/dev/null
     
     if [[ -f /etc/ssh/sshd_config ]]; then
@@ -836,7 +874,7 @@ show_completion() {
     
     echo -e "${GREEN}AmneziaWG Configuration:${NC}"
     echo -e "Server IP: ${SERVER_IP}"
-    echo -e "Port: 51821"
+    echo -e "Port: 443"
     echo -e "Subnet: 10.0.1.x"
     echo -e "Obfuscation: Enabled (Anti-DPI)"
     echo -e ""
@@ -883,9 +921,9 @@ verify_installation() {
         HAS_ERRORS=1
     fi
 
-    # 3. Check MTProto Service
-    if systemctl is-active --quiet mtproto; then
-        echo -e "${GREEN}✓ MTProto Proxy is RUNNING${NC}"
+    # 3. Check MTProto Service (Docker)
+    if docker ps | grep -q mtproxy; then
+        echo -e "${GREEN}✓ MTProto Proxy is RUNNING (Docker)${NC}"
     else
         echo -e "${RED}✗ MTProto Proxy is NOT RUNNING${NC}"
         HAS_ERRORS=1
@@ -899,11 +937,11 @@ verify_installation() {
         HAS_ERRORS=1
     fi
 
-    # 5. Check UFW rules for AmneziaWG (port 51821)
-    if ufw status | grep -q "51821/udp"; then
-        echo -e "${GREEN}✓ UFW rule for AmneziaWG (51821/udp) is PRESENT${NC}"
+    # 5. Check UFW rules for AmneziaWG (port 443)
+    if ufw status | grep -q "443/udp"; then
+        echo -e "${GREEN}✓ UFW rule for AmneziaWG (443/udp) is PRESENT${NC}"
     else
-        echo -e "${RED}✗ UFW rule for AmneziaWG (51821/udp) is MISSING${NC}"
+        echo -e "${RED}✗ UFW rule for AmneziaWG (443/udp) is MISSING${NC}"
         HAS_ERRORS=1
     fi
 
