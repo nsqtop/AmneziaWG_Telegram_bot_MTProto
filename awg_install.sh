@@ -3,7 +3,7 @@
 # ======================================================
 # AmneziaWG + MTProto Proxy + Telegram Bot Installer
 # Version: 1.1 (Parallel execution ready)
-# Author: nsqtop
+# Author: System Admin
 # ======================================================
 
 set -e
@@ -137,6 +137,7 @@ configure_amneziawg() {
 [Interface]
 Address = 10.0.1.1/24
 ListenPort = 443
+MTU = 1200
 PrivateKey = $SERVER_PRIV_KEY
 Jc = $JC
 Jmin = $JMIN
